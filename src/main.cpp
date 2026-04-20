@@ -13,11 +13,12 @@ constexpr uint32_t BASE_ID_DUTY_CYCLE_SET = 0x2050080;
 constexpr int BUTTON_FORWARD_PIN = 32;
 constexpr int BUTTON_REVERSE_PIN = 33;
 
-constexpr float TARGET_DUTY_CYCLE = 1.00f;
+constexpr float TARGET_DUTY_CYCLE = 0.50f;
 constexpr float STOP_DUTY_CYCLE = 0.0f;
 constexpr uint32_t HEARTBEAT_INTERVAL_MS = 5;
 constexpr uint32_t CONTROL_INTERVAL_MS = 5;
 constexpr uint32_t DEBOUNCE_MS = 25;
+constexpr float RAMP_DUTY_PER_SEC = 1.0f;
 
 uint32_t lastHeartbeatMs = 0;
 uint32_t lastControlMs = 0;
@@ -25,6 +26,7 @@ uint32_t lastDiagMs = 0;
 uint32_t txOkCount = 0;
 uint32_t txFailCount = 0;
 float lastCommandedDuty = 999999.0f;
+float smoothedDuty = STOP_DUTY_CYCLE;
 
 bool forwardStablePressed = false;
 bool reverseStablePressed = false;
@@ -56,6 +58,24 @@ float getDutyFromButtons(bool forwardPressed, bool reversePressed) {
     return -TARGET_DUTY_CYCLE;
   }
   return STOP_DUTY_CYCLE;
+}
+
+float applyRamp(float currentDuty, float targetDuty, float deltaTimeSec) {
+  float maxStep = RAMP_DUTY_PER_SEC * deltaTimeSec;
+
+  if (targetDuty > currentDuty) {
+    currentDuty += maxStep;
+    if (currentDuty > targetDuty) {
+      currentDuty = targetDuty;
+    }
+  } else if (targetDuty < currentDuty) {
+    currentDuty -= maxStep;
+    if (currentDuty < targetDuty) {
+      currentDuty = targetDuty;
+    }
+  }
+
+  return currentDuty;
 }
 
 const char* twaiStateToText(twai_state_t state) {
@@ -165,6 +185,8 @@ void setup() {
   Serial.println(DEVICE_ID);
   Serial.print("Duty target (-1..1): ");
   Serial.println(TARGET_DUTY_CYCLE, 3);
+  Serial.print("Ramp rate (duty/sec): ");
+  Serial.println(RAMP_DUTY_PER_SEC, 3);
   Serial.print("Forward button pin: ");
   Serial.println(BUTTON_FORWARD_PIN);
   Serial.print("Reverse button pin: ");
@@ -202,17 +224,17 @@ void loop() {
     nowMs
   );
 
-  float activeSetpoint = getDutyFromButtons(forwardPressed, reversePressed);
+  float targetSetpoint = getDutyFromButtons(forwardPressed, reversePressed);
 
-  if (activeSetpoint != lastCommandedDuty) {
-    if (activeSetpoint > 0.0f) {
+  if (targetSetpoint != lastCommandedDuty) {
+    if (targetSetpoint > 0.0f) {
       Serial.println("Command: FORWARD");
-    } else if (activeSetpoint < 0.0f) {
+    } else if (targetSetpoint < 0.0f) {
       Serial.println("Command: REVERSE");
     } else {
       Serial.println("Phase: STOP");
     }
-    lastCommandedDuty = activeSetpoint;
+    lastCommandedDuty = targetSetpoint;
   }
 
   if ((nowMs - lastHeartbeatMs) >= HEARTBEAT_INTERVAL_MS) {
@@ -221,7 +243,9 @@ void loop() {
   }
 
   if ((nowMs - lastControlMs) >= CONTROL_INTERVAL_MS) {
-    sendDutyCycleSetpoint(activeSetpoint);
+    float deltaTimeSec = static_cast<float>(nowMs - lastControlMs) / 1000.0f;
+    smoothedDuty = applyRamp(smoothedDuty, targetSetpoint, deltaTimeSec);
+    sendDutyCycleSetpoint(smoothedDuty);
     lastControlMs = nowMs;
   }
 
