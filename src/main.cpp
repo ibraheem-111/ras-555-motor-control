@@ -5,31 +5,30 @@
 
 constexpr gpio_num_t CAN_TXD_PIN = GPIO_NUM_22;
 constexpr gpio_num_t CAN_RXD_PIN = GPIO_NUM_23;
-constexpr bool CAN_NO_ACK_MODE = false;   // keep false for a real Spark MAX on the bus
-
+constexpr bool CAN_NO_ACK_MODE = false;
 constexpr uint32_t DEVICE_ID = 4;
 
-// Spark MAX CAN IDs from the protocol definition
-constexpr uint32_t BASE_ID_NON_RIO_HEARTBEAT = 0x2052C80; // broadcast heartbeat for non-RIO master
-constexpr uint32_t BASE_ID_VELOCITY_SET      = 0x2050480; // closed-loop velocity setpoint
+constexpr uint32_t BASE_ID_HEARTBEAT        = 0x2052C80;
+constexpr uint32_t BASE_ID_VELOCITY_SET     = 0x2050480;
+constexpr uint32_t BASE_ID_STATUS_0         = 0x2051800;
+constexpr uint32_t BASE_ID_STATUS_1         = 0x2051840;
+constexpr uint32_t BASE_ID_STATUS_2         = 0x2051880;
 
 constexpr int BUTTON_FORWARD_PIN = 32;
 constexpr int BUTTON_REVERSE_PIN = 33;
 
-constexpr float TARGET_VELOCITY_RPM = 1000.0f;  // change this to your desired speed
+constexpr float TARGET_VELOCITY_RPM = 4000.0f;
 constexpr float STOP_VELOCITY_RPM   = 0.0f;
-constexpr float RAMP_RPM_PER_SEC     = 100.0f;  // lower = smoother, higher = snappier
+constexpr float RAMP_RPM_PER_SEC    = 2000.0f;
 
 constexpr uint32_t HEARTBEAT_INTERVAL_MS = 5;
 constexpr uint32_t CONTROL_INTERVAL_MS   = 5;
 constexpr uint32_t DEBOUNCE_MS           = 25;
+constexpr uint32_t PRINT_INTERVAL_MS     = 200;
 
 uint32_t lastHeartbeatMs = 0;
 uint32_t lastControlMs = 0;
-uint32_t lastDiagMs = 0;
-
-uint32_t txOkCount = 0;
-uint32_t txFailCount = 0;
+uint32_t lastPrintMs = 0;
 
 float smoothedVelocityRpm = STOP_VELOCITY_RPM;
 float lastRequestedVelocityRpm = 999999.0f;
@@ -41,20 +40,30 @@ bool reverseLastRawPressed = false;
 uint32_t forwardLastChangeMs = 0;
 uint32_t reverseLastChangeMs = 0;
 
-uint32_t canAlertsEnabled =
-    TWAI_ALERT_TX_SUCCESS |
-    TWAI_ALERT_TX_FAILED  |
-    TWAI_ALERT_BUS_ERROR  |
-    TWAI_ALERT_ARB_LOST   |
-    TWAI_ALERT_ERR_PASS   |
-    TWAI_ALERT_BUS_OFF    |
-    TWAI_ALERT_ABOVE_ERR_WARN |
-    TWAI_ALERT_BELOW_ERR_WARN;
-// Optional: have the driver also print alerts to UART automatically
-// | TWAI_ALERT_AND_LOG;
+// Telemetry from Spark MAX
+float rxAppliedOutput = NAN;
+float rxVelocityRpm = NAN;
+float rxPositionRot = NAN;
+uint16_t rxFaults = 0;
+uint16_t rxStickyFaults = 0;
+uint32_t rxStatus0Count = 0;
+uint32_t rxStatus1Count = 0;
+uint32_t rxStatus2Count = 0;
 
 static inline uint32_t sparkFrameId(uint32_t baseId) {
   return baseId | (DEVICE_ID & 0x3F);
+}
+
+float bytesToFloatLE(const uint8_t *data) {
+  uint32_t raw =
+      ((uint32_t)data[3] << 24) |
+      ((uint32_t)data[2] << 16) |
+      ((uint32_t)data[1] << 8)  |
+      ((uint32_t)data[0] << 0);
+
+  float out;
+  memcpy(&out, &raw, sizeof(out));
+  return out;
 }
 
 bool updateDebouncedPressed(
@@ -79,12 +88,8 @@ bool updateDebouncedPressed(
 }
 
 float getVelocityFromButtons(bool forwardPressed, bool reversePressed) {
-  if (forwardPressed && !reversePressed) {
-    return TARGET_VELOCITY_RPM;
-  }
-  if (reversePressed && !forwardPressed) {
-    return -TARGET_VELOCITY_RPM;
-  }
+  if (forwardPressed && !reversePressed) return TARGET_VELOCITY_RPM;
+  if (reversePressed && !forwardPressed) return -TARGET_VELOCITY_RPM;
   return STOP_VELOCITY_RPM;
 }
 
@@ -93,83 +98,70 @@ float applyRamp(float currentValue, float targetValue, float deltaTimeSec) {
 
   if (targetValue > currentValue) {
     currentValue += maxStep;
-    if (currentValue > targetValue) {
-      currentValue = targetValue;
-    }
+    if (currentValue > targetValue) currentValue = targetValue;
   } else if (targetValue < currentValue) {
     currentValue -= maxStep;
-    if (currentValue < targetValue) {
-      currentValue = targetValue;
-    }
+    if (currentValue < targetValue) currentValue = targetValue;
   }
 
   return currentValue;
 }
 
-const char* twaiStateToText(twai_state_t state) {
-  switch (state) {
-    case TWAI_STATE_STOPPED:    return "STOPPED";
-    case TWAI_STATE_RUNNING:    return "RUNNING";
-    case TWAI_STATE_BUS_OFF:    return "BUS_OFF";
-    case TWAI_STATE_RECOVERING: return "RECOVERING";
-    default:                    return "UNKNOWN";
-  }
-}
-
 bool sendExtendedFrame(uint32_t extId, const uint8_t *data, uint8_t dataLen) {
-  if (dataLen > 8) {
-    return false;
-  }
+  if (dataLen > 8) return false;
 
   twai_message_t msg{};
   msg.identifier = extId;
   msg.extd = 1;
   msg.rtr = 0;
-  msg.ss = 1;
   msg.data_length_code = dataLen;
 
   for (uint8_t i = 0; i < dataLen; i++) {
     msg.data[i] = data[i];
   }
 
-  esp_err_t err = twai_transmit(&msg, pdMS_TO_TICKS(10));
-  if (err == ESP_OK) {
-    txOkCount++;
-    return true;
-  }
-
-  txFailCount++;
-  return false;
+  return twai_transmit(&msg, pdMS_TO_TICKS(10)) == ESP_OK;
 }
 
 bool sendHeartbeat() {
-  const uint8_t heartbeatData[8] = {255, 255, 255, 255, 255, 255, 255, 255};
-  return sendExtendedFrame(BASE_ID_NON_RIO_HEARTBEAT, heartbeatData, 8);
+  const uint8_t heartbeatData[8] = {255,255,255,255,255,255,255,255};
+  return sendExtendedFrame(BASE_ID_HEARTBEAT, heartbeatData, 8);
 }
 
 bool sendVelocitySetpoint(float rpm) {
-  uint8_t data[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+  uint8_t data[8] = {0,0,0,0,0,0,0,0};
   memcpy(data, &rpm, sizeof(rpm));
-
-  // Bytes 4..7 left zero for a simple setpoint with no extra feedforward/slot fields.
   return sendExtendedFrame(sparkFrameId(BASE_ID_VELOCITY_SET), data, 8);
 }
 
-void printCanStatus() {
-  twai_status_info_t info{};
-  if (twai_get_status_info(&info) == ESP_OK) {
-    Serial.print("CAN state=");
-    Serial.print(twaiStateToText(info.state));
-    Serial.print(" tx_ok=");
-    Serial.print(txOkCount);
-    Serial.print(" tx_fail=");
-    Serial.print(txFailCount);
-    Serial.print(" tx_err=");
-    Serial.print(info.tx_error_counter);
-    Serial.print(" rx_err=");
-    Serial.print(info.rx_error_counter);
-    Serial.print(" tx_failed_cnt=");
-    Serial.println(info.tx_failed_count);
+bool sendPeriodicFramePeriod(uint32_t baseId, uint16_t periodMs) {
+  uint8_t data[2];
+  data[0] = (uint8_t)(periodMs & 0xFF);
+  data[1] = (uint8_t)((periodMs >> 8) & 0xFF);
+  return sendExtendedFrame(sparkFrameId(baseId), data, 2);
+}
+
+void pollCanRx() {
+  twai_message_t msg{};
+
+  while (twai_receive(&msg, 0) == ESP_OK) {
+    if (!msg.extd) continue;
+
+    if (msg.identifier == sparkFrameId(BASE_ID_STATUS_0) && msg.data_length_code >= 6) {
+      int16_t appliedRaw = (int16_t)(((uint16_t)msg.data[1] << 8) | msg.data[0]);
+      rxAppliedOutput = (float)appliedRaw / 32767.0f;
+      rxFaults = (uint16_t)(((uint16_t)msg.data[3] << 8) | msg.data[2]);
+      rxStickyFaults = (uint16_t)(((uint16_t)msg.data[5] << 8) | msg.data[4]);
+      rxStatus0Count++;
+    }
+    else if (msg.identifier == sparkFrameId(BASE_ID_STATUS_1) && msg.data_length_code >= 4) {
+      rxVelocityRpm = bytesToFloatLE(msg.data);
+      rxStatus1Count++;
+    }
+    else if (msg.identifier == sparkFrameId(BASE_ID_STATUS_2) && msg.data_length_code >= 4) {
+      rxPositionRot = bytesToFloatLE(msg.data);
+      rxStatus2Count++;
+    }
   }
 }
 
@@ -179,56 +171,9 @@ bool initCan() {
   twai_timing_config_t tConfig = TWAI_TIMING_CONFIG_1MBITS();
   twai_filter_config_t fConfig = TWAI_FILTER_CONFIG_ACCEPT_ALL();
 
-  if (twai_driver_install(&gConfig, &tConfig, &fConfig) != ESP_OK) {
-    Serial.println("twai_driver_install() failed");
-    return false;
-  }
-
-  if (twai_reconfigure_alerts(canAlertsEnabled, nullptr) != ESP_OK) {
-    Serial.println("twai_reconfigure_alerts() failed");
-    return false;
-  }
-
-  if (twai_start() != ESP_OK) {
-    Serial.println("twai_start() failed");
-    return false;
-  }
-
+  if (twai_driver_install(&gConfig, &tConfig, &fConfig) != ESP_OK) return false;
+  if (twai_start() != ESP_OK) return false;
   return true;
-}
-
-void pollCanAlerts() {
-  uint32_t alerts = 0;
-
-  // Non-blocking: read all currently pending alerts
-  while (twai_read_alerts(&alerts, 0) == ESP_OK) {
-    if (alerts & TWAI_ALERT_TX_SUCCESS) {
-      Serial.println("CAN ALERT: TX_SUCCESS (frame transmitted successfully)");
-    }
-    if (alerts & TWAI_ALERT_TX_FAILED) {
-      Serial.println("CAN ALERT: TX_FAILED");
-    }
-    if (alerts & TWAI_ALERT_BUS_ERROR) {
-      Serial.println("CAN ALERT: BUS_ERROR (bit/stuff/CRC/form/ACK)");
-    }
-    if (alerts & TWAI_ALERT_ARB_LOST) {
-      Serial.println("CAN ALERT: ARB_LOST");
-    }
-    if (alerts & TWAI_ALERT_ABOVE_ERR_WARN) {
-      Serial.println("CAN ALERT: ABOVE_ERR_WARN");
-    }
-    if (alerts & TWAI_ALERT_BELOW_ERR_WARN) {
-      Serial.println("CAN ALERT: BELOW_ERR_WARN");
-    }
-    if (alerts & TWAI_ALERT_ERR_PASS) {
-      Serial.println("CAN ALERT: ERR_PASS");
-    }
-    if (alerts & TWAI_ALERT_BUS_OFF) {
-      Serial.println("CAN ALERT: BUS_OFF");
-    }
-
-    printCanStatus();
-  }
 }
 
 void setup() {
@@ -246,93 +191,78 @@ void setup() {
   forwardLastChangeMs = nowMs;
   reverseLastChangeMs = nowMs;
 
-  Serial.println("Booting SPARK MAX CAN velocity controller...");
-  Serial.print("ESP32->Transceiver TXD pin: ");
-  Serial.println(static_cast<int>(CAN_TXD_PIN));
-  Serial.print("ESP32<-Transceiver RXD pin: ");
-  Serial.println(static_cast<int>(CAN_RXD_PIN));
-  Serial.print("CAN mode: ");
-  Serial.println(CAN_NO_ACK_MODE ? "NO_ACK (single-node test)" : "NORMAL (requires ACK)");
-  Serial.print("Device ID: ");
-  Serial.println(DEVICE_ID);
-  Serial.print("Target velocity (RPM): ");
-  Serial.println(TARGET_VELOCITY_RPM, 1);
-  Serial.print("Ramp rate (RPM/sec): ");
-  Serial.println(RAMP_RPM_PER_SEC, 1);
-  Serial.print("Forward button pin: ");
-  Serial.println(BUTTON_FORWARD_PIN);
-  Serial.print("Reverse button pin: ");
-  Serial.println(BUTTON_REVERSE_PIN);
+  Serial.println("Booting SPARK MAX velocity diagnostic...");
 
   if (!initCan()) {
     Serial.println("CAN init failed");
-    while (true) {
-      delay(1000);
-    }
+    while (true) delay(1000);
   }
 
   sendHeartbeat();
-  sendVelocitySetpoint(STOP_VELOCITY_RPM);
-  Serial.println("SPARK MAX velocity stream started");
-  printCanStatus();
+  sendVelocitySetpoint(0.0f);
+
+  // Explicitly request telemetry
+  sendPeriodicFramePeriod(BASE_ID_STATUS_0, 10);
+  sendPeriodicFramePeriod(BASE_ID_STATUS_1, 20);
+  sendPeriodicFramePeriod(BASE_ID_STATUS_2, 20);
+
+  Serial.println("Telemetry requested: status0=10ms status1=20ms status2=20ms");
 }
 
 void loop() {
   uint32_t nowMs = millis();
-  pollCanAlerts();
+
+  pollCanRx();
 
   bool forwardPressed = updateDebouncedPressed(
-    BUTTON_FORWARD_PIN,
-    forwardLastRawPressed,
-    forwardStablePressed,
-    forwardLastChangeMs,
-    nowMs
+    BUTTON_FORWARD_PIN, forwardLastRawPressed, forwardStablePressed, forwardLastChangeMs, nowMs
   );
-
   bool reversePressed = updateDebouncedPressed(
-    BUTTON_REVERSE_PIN,
-    reverseLastRawPressed,
-    reverseStablePressed,
-    reverseLastChangeMs,
-    nowMs
+    BUTTON_REVERSE_PIN, reverseLastRawPressed, reverseStablePressed, reverseLastChangeMs, nowMs
   );
 
   float targetVelocityRpm = getVelocityFromButtons(forwardPressed, reversePressed);
 
   if (targetVelocityRpm != lastRequestedVelocityRpm) {
-    if (targetVelocityRpm > 0.0f) {
-      Serial.println("Command: FORWARD");
-    } else if (targetVelocityRpm < 0.0f) {
-      Serial.println("Command: REVERSE");
-    } else {
-      Serial.println("Command: STOP");
-    }
+    if (targetVelocityRpm > 0.0f) Serial.println("Command: FORWARD");
+    else if (targetVelocityRpm < 0.0f) Serial.println("Command: REVERSE");
+    else Serial.println("Command: STOP");
     lastRequestedVelocityRpm = targetVelocityRpm;
   }
 
   if ((nowMs - lastHeartbeatMs) >= HEARTBEAT_INTERVAL_MS) {
-    bool ok = sendHeartbeat();
-    if (!ok) {
-      Serial.println("Heartbeat queue failed");
-    }
+    sendHeartbeat();
     lastHeartbeatMs = nowMs;
   }
 
   if ((nowMs - lastControlMs) >= CONTROL_INTERVAL_MS) {
-    float deltaTimeSec = static_cast<float>(nowMs - lastControlMs) / 1000.0f;
-    smoothedVelocityRpm = applyRamp(smoothedVelocityRpm, targetVelocityRpm, deltaTimeSec);
-
-    bool ok = sendVelocitySetpoint(smoothedVelocityRpm);
-    if (!ok) {
-      Serial.println("Velocity frame queue failed");
-    }
-
+    float dt = (float)(nowMs - lastControlMs) / 1000.0f;
+    smoothedVelocityRpm = applyRamp(smoothedVelocityRpm, targetVelocityRpm, dt);
+    sendVelocitySetpoint(smoothedVelocityRpm);
     lastControlMs = nowMs;
   }
 
-  if ((nowMs - lastDiagMs) >= 1000) {
-    printCanStatus();
-    lastDiagMs = nowMs;
+  if ((nowMs - lastPrintMs) >= PRINT_INTERVAL_MS) {
+    Serial.print("cmd_rpm=");
+    Serial.print(smoothedVelocityRpm, 1);
+    Serial.print("  rx_rpm=");
+    Serial.print(rxVelocityRpm, 1);
+    Serial.print("  rx_pos=");
+    Serial.print(rxPositionRot, 3);
+    Serial.print("  applied=");
+    Serial.print(rxAppliedOutput, 3);
+    Serial.print("  faults=0x");
+    Serial.print(rxFaults, HEX);
+    Serial.print("  sticky=0x");
+    Serial.print(rxStickyFaults, HEX);
+    Serial.print("  counts[");
+    Serial.print(rxStatus0Count);
+    Serial.print(",");
+    Serial.print(rxStatus1Count);
+    Serial.print(",");
+    Serial.print(rxStatus2Count);
+    Serial.println("]");
+    lastPrintMs = nowMs;
   }
 
   delay(5);
